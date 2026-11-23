@@ -100,8 +100,7 @@ slider_specs = [
     ("Motion dx (mm)", -80.0, 80.0, 25.0),
     ("Motion dy (mm)", -80.0, 80.0, -20.0),
     ("B0 inhomogeneity (ppm/FOV)", 0.0, 5.0, 0.0),
-    ("Thermal noise SD", 0.0, 0.02, 0.00),
-    ("Electrical noise SD", 0.0, 0.02, 0.00),
+    ("Receiver noise SD", 0.0, 0.75, 0.00),
     ("Noise seed", 0.0, 10000.0, 123.0),
 ]
 
@@ -117,7 +116,7 @@ for index, (label, low, high, initial) in enumerate(slider_specs):
 # Create a small checkbox panel for enabling the optional effects.
 check_axis = fig.add_axes([0.80, 0.11, 0.17, 0.18])
 # Motion is enabled initially so its consequence is immediately visible.
-checks = CheckButtons(check_axis, ["Enable motion", "Thermal noise", "Electrical noise"], [True, False, False])
+checks = CheckButtons(check_axis, ["Enable motion", "Enable receiver noise"], [True, False])
 # Put a concise title above the checkbox panel.
 check_axis.set_title("Optional effects", fontsize=9)
 
@@ -144,30 +143,48 @@ def make_circular_voxel(signal_at_te, x_m, y_m, radius_m):
     return signal_at_te * inside_voxel.astype(float)
 
 
-def apply_b0_inhomogeneity(object_image, inhomogeneity_ppm_per_fov):
-    """Apply the TE phase caused by a linear static-B0 error across one FOV."""
-    # Convert the requested parts-per-million variation across the FOV into a local field error in tesla.
-    delta_b0_t = B0_T * inhomogeneity_ppm_per_fov * 1e-6 * (x_grid_m / FOV_M)
-    # Convert that local field error into off-resonance phase accumulated by the echo time.
-    off_resonance_phase = -2 * np.pi * GAMMA_HZ * delta_b0_t * TE_S
-    # Return the complex object after its spatially varying B0 phase has been applied.
-    return object_image * np.exp(1j * off_resonance_phase)
+def make_b0_off_resonance_map(inhomogeneity_ppm_per_fov):
+    """Make a curved static-B0 field map and return its local frequency offsets in hertz."""
+    # Form a curved, dimensionless field-error shape that is zero at isocentre and grows away from it.
+    field_shape = (2 * x_grid_m / FOV_M) ** 2 + (2 * y_grid_m / FOV_M) ** 2
+    # Convert the requested peak scale from parts per million into a local B0 error in tesla.
+    delta_b0_t = B0_T * inhomogeneity_ppm_per_fov * 1e-6 * field_shape
+    # Convert the local B0 error to an off-resonance frequency map in cycles per second (hertz).
+    return GAMMA_HZ * delta_b0_t
 
 
-def make_kspace(object_before, object_after, gx_tpm, gy_tpm, motion_on, thermal_on, electrical_on, thermal_sd, electrical_sd, seed):
+def forward_encode(object_image, kx, ky, readout_time_s, off_resonance_hz):
+    """Encode one object while B0 phase continues to accumulate throughout the readout."""
+    # Make the x-direction Fourier phase matrix for every kx location and image x coordinate.
+    ex = np.exp(-2j * np.pi * np.outer(kx, coords_m))
+    # Make the y-direction Fourier phase matrix for every ky location and image y coordinate.
+    ey = np.exp(-2j * np.pi * np.outer(ky, coords_m))
+    # Allocate one complex value for every phase-encode and readout sample.
+    encoded_kspace = np.empty((N, N), dtype=complex)
+    # Calculate every readout sample separately because off-resonance phase changes with time.
+    for column, time_from_te_s in enumerate(readout_time_s):
+        # Accumulate the local B0 phase from excitation through this particular sample time.
+        b0_phase = np.exp(-2j * np.pi * off_resonance_hz * (TE_S + time_from_te_s))
+        # Apply that time-dependent phase to the object before spatial encoding this sample.
+        object_at_sample = object_image * b0_phase
+        # Sum the Fourier-encoded contribution of every object pixel for every ky value at this kx value.
+        encoded_kspace[:, column] = ey @ object_at_sample @ ex[column, :] / N
+    # Return the fully encoded k-space data matrix.
+    return encoded_kspace
+
+
+def make_kspace(object_before, object_after, gx_tpm, gy_tpm, off_resonance_hz, motion_on, noise_on, noise_sd, seed):
     """Apply the Fourier forward model to the finite voxel before and after a motion event."""
     # Create the readout kx locations in cycles per metre.
     kx = GAMMA_HZ * gx_tpm * np.linspace(-READOUT_S / 2, READOUT_S / 2, N, endpoint=False)
     # Create the phase-encode ky locations in cycles per metre.
     ky = GAMMA_HZ * gy_tpm * PHASE_S * np.linspace(-1, 1, N, endpoint=False)
-    # Make the x-direction Fourier phase matrix for every kx location and image x coordinate.
-    ex = np.exp(-2j * np.pi * np.outer(kx, coords_m))
-    # Make the y-direction Fourier phase matrix for every ky location and image y coordinate.
-    ey = np.exp(-2j * np.pi * np.outer(ky, coords_m))
+    # Make one timing value for every readout sample, with the k-space centre acquired at TE.
+    readout_time_s = np.linspace(-READOUT_S / 2, READOUT_S / 2, N, endpoint=False)
     # Transform the reference object into its complete stationary k-space data matrix.
-    kspace_before = ey @ object_before @ ex.T / N
+    kspace_before = forward_encode(object_before, kx, ky, readout_time_s, off_resonance_hz)
     # Transform the displaced object into the k-space data that would be acquired after movement.
-    kspace_after = ey @ object_after @ ex.T / N
+    kspace_after = forward_encode(object_after, kx, ky, readout_time_s, off_resonance_hz)
     # Start with the data from the object before it moves.
     kspace = kspace_before.copy()
     # Place the instantaneous movement halfway through the ordered acquisition.
@@ -178,14 +195,10 @@ def make_kspace(object_before, object_after, gx_tpm, gy_tpm, motion_on, thermal_
         kspace.flat[motion_sample:] = kspace_after.flat[motion_sample:]
     # Make a repeatable random-number generator so the seed selects a noise realization.
     rng = np.random.default_rng(seed)
-    # Add circular complex Gaussian thermal noise if the thermal checkbox is enabled.
-    if thermal_on and thermal_sd > 0:
-        # Divide by sqrt(2) so thermal_sd is the complex noise RMS convention used here.
-        kspace += thermal_sd * (rng.normal(size=(N, N)) + 1j * rng.normal(size=(N, N))) / np.sqrt(2)
-    # Add independent circular complex Gaussian receiver-electronics noise if requested.
-    if electrical_on and electrical_sd > 0:
-        # This has the same mathematical distribution as thermal receiver noise, but a separate source level.
-        kspace += electrical_sd * (rng.normal(size=(N, N)) + 1j * rng.normal(size=(N, N))) / np.sqrt(2)
+    # Add circular complex Gaussian receiver noise if the receiver-noise checkbox is enabled.
+    if noise_on and noise_sd > 0:
+        # Divide by sqrt(2) so noise_sd is the requested complex-noise RMS magnitude.
+        kspace += noise_sd * (rng.normal(size=(N, N)) + 1j * rng.normal(size=(N, N))) / np.sqrt(2)
     # Return acquired k-space, stationary k-space, and physical sample-coordinate vectors for diagnostics.
     return kspace, kspace_before, kx, ky
 
@@ -198,14 +211,12 @@ def update(_=None):
     dy_m = sliders[1].val * 1e-3
     # Read the linear B0 variation across the field of view in parts per million.
     inhomogeneity_ppm_per_fov = sliders[2].val
-    # Read the thermal-noise standard deviation.
-    thermal_sd = sliders[3].val
-    # Read the electronics-noise standard deviation.
-    electrical_sd = sliders[4].val
+    # Read the combined receiver-noise standard deviation.
+    noise_sd = sliders[3].val
     # Round the final slider to obtain an integer random seed.
-    seed = int(round(sliders[5].val))
-    # Read the three checkbox states in their displayed order.
-    motion_on, thermal_on, electrical_on = checks.get_status()
+    seed = int(round(sliders[4].val))
+    # Read the two checkbox states in their displayed order.
+    motion_on, noise_on = checks.get_status()
 
     # Predict the fixed finite voxel-region's magnitude at TE and calculate its RF flip angle.
     signal_at_te, alpha_rad = spoiled_gre_signal(PROTON_DENSITY, T1_S, T2STAR_S, TR_S, TE_S, B1_T)
@@ -213,17 +224,17 @@ def update(_=None):
     object_before = make_circular_voxel(signal_at_te, VOXEL_X_M, VOXEL_Y_M, VOXEL_RADIUS_M)
     # Make the same finite object at its displaced position after the motion event.
     object_after = make_circular_voxel(signal_at_te, VOXEL_X_M + dx_m, VOXEL_Y_M + dy_m, VOXEL_RADIUS_M)
-    # Add static spatially varying B0 phase to the object before movement.
-    object_before = apply_b0_inhomogeneity(object_before, inhomogeneity_ppm_per_fov)
-    # Add the same scanner B0 phase map to the object after movement.
-    object_after = apply_b0_inhomogeneity(object_after, inhomogeneity_ppm_per_fov)
+    # Make the scanner-fixed curved B0 map that causes spatially varying off-resonance frequency.
+    off_resonance_hz = make_b0_off_resonance_map(inhomogeneity_ppm_per_fov)
     # Generate the acquired k-space from the forward model and add any enabled noise.
-    kspace, stationary_kspace, kx, ky = make_kspace(object_before, object_after, GX_TPM, GY_TPM, motion_on, thermal_on, electrical_on, thermal_sd, electrical_sd, seed)
+    kspace, stationary_kspace, kx, ky = make_kspace(object_before, object_after, GX_TPM, GY_TPM, off_resonance_hz, motion_on, noise_on, noise_sd, seed)
+    # Make the ideal reference scan: stationary object, perfectly homogeneous B0, and no receiver noise.
+    ideal_kspace, _, _, _ = make_kspace(object_before, object_before, GX_TPM, GY_TPM, np.zeros_like(off_resonance_hz), False, False, 0.0, seed)
     # Invert the sampled k-space with the standard unitary two-dimensional inverse DFT.
     reconstruction = np.fft.fftshift(np.fft.ifft2(np.fft.fftshift(kspace), norm="ortho"))
 
-    # Display the initial finite object's magnitude, because B0 inhomogeneity makes its stored signal complex.
-    object_display = np.abs(object_before)
+    # Display the initial finite object's magnitude; B0 phase is invisible in an object-magnitude view.
+    object_display = object_before
 
     # Update the object panel with the current point locations.
     object_im.set_data(object_display)
@@ -238,18 +249,18 @@ def update(_=None):
     # Update the reconstruction brightness scale.
     recon_im.set_clim(0, max(np.abs(reconstruction).max(), 1e-9))
 
-    # Calculate the magnitude of data inconsistency relative to a stationary, noiseless scan.
-    kspace_difference = np.abs(kspace - stationary_kspace)
+    # Calculate the total k-space change relative to an ideal stationary scan with homogeneous B0.
+    kspace_difference = np.abs(kspace - ideal_kspace)
     # Clear the previous k-space-difference trace before drawing the new one.
     signal_axis.clear()
-    # Plot difference in exact acquisition order; motion creates nonzero data only after the event.
+    # Plot difference in exact acquisition order; B0, motion, and noise can each make it nonzero.
     signal_axis.plot(kspace_difference.ravel(), color="tab:blue", linewidth=1)
     # Mark the exact sample at which motion begins when enabled.
     if motion_on:
         # Draw the boundary between data acquired before and after the displacement.
         signal_axis.axvline(N * N // 2, color="tab:red", linestyle="--", label="motion event")
     # Label the diagnostic plot with the comparison it makes.
-    signal_axis.set_title("K-space difference from a stationary finite voxel")
+    signal_axis.set_title("K-space difference from ideal stationary homogeneous-B0 scan")
     # Label its horizontal axis.
     signal_axis.set_xlabel("acquisition sample number")
     # Label its vertical axis.
